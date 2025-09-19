@@ -2,11 +2,14 @@ use std::path::PathBuf;
 
 use axum::{
     BoxError, Extension, Json, Router,
-    extract::{Query, State},
+    extract::{
+        Query, State,
+        ws::{WebSocket, WebSocketUpgrade},
+    },
     http::StatusCode,
     middleware::from_fn_with_state,
     response::{
-        Json as ResponseJson, Sse,
+        IntoResponse, Json as ResponseJson, Sse,
         sse::{Event, KeepAlive},
     },
     routing::{get, post},
@@ -328,7 +331,7 @@ async fn has_running_processes_for_attempt(
     pool: &sqlx::SqlitePool,
     attempt_id: Uuid,
 ) -> Result<bool, ApiError> {
-    let processes = ExecutionProcess::find_by_task_attempt_id(pool, attempt_id).await?;
+    let processes = ExecutionProcess::find_by_task_attempt_id(pool, attempt_id, false).await?;
     Ok(processes.into_iter().any(|p| {
         matches!(
             p.status,
@@ -513,22 +516,52 @@ pub async fn save_follow_up_draft(
 }
 
 #[axum::debug_handler]
-pub async fn stream_follow_up_draft(
+pub async fn stream_follow_up_draft_ws(
+    ws: WebSocketUpgrade,
     Extension(task_attempt): Extension<TaskAttempt>,
     State(deployment): State<DeploymentImpl>,
-) -> Result<
-    Sse<impl futures_util::Stream<Item = Result<Event, Box<dyn std::error::Error + Send + Sync>>>>,
-    ApiError,
-> {
-    let stream = deployment
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        if let Err(e) = handle_follow_up_draft_ws(socket, deployment, task_attempt.id).await {
+            tracing::warn!("follow-up draft WS closed: {}", e);
+        }
+    })
+}
+
+async fn handle_follow_up_draft_ws(
+    socket: WebSocket,
+    deployment: DeploymentImpl,
+    task_attempt_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    use futures_util::{SinkExt, StreamExt, TryStreamExt};
+
+    let mut stream = deployment
         .events()
-        .stream_follow_up_draft_for_attempt(task_attempt.id)
-        .await
-        .map_err(|e| ApiError::from(deployment::DeploymentError::from(e)))?;
-    Ok(
-        Sse::new(stream.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) }))
-            .keep_alive(KeepAlive::default()),
-    )
+        .stream_follow_up_draft_for_attempt_raw(task_attempt_id)
+        .await?
+        .map_ok(|msg| msg.to_ws_message_unchecked());
+
+    // Split socket into sender and receiver
+    let (mut sender, mut receiver) = socket.split();
+
+    // Drain (and ignore) any client->server messages so pings/pongs work
+    tokio::spawn(async move { while let Some(Ok(_)) = receiver.next().await {} });
+
+    // Forward server messages
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(msg) => {
+                if sender.send(msg).await.is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::error!("stream error: {}", e);
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[axum::debug_handler]
@@ -602,18 +635,21 @@ pub async fn set_follow_up_queue(
                 tokio::time::sleep(Duration::from_millis(1200)).await;
                 let pool = &deployment_clone.db().pool;
                 // Still no running process?
-                let running =
-                    match ExecutionProcess::find_by_task_attempt_id(pool, task_attempt_clone.id)
-                        .await
-                    {
-                        Ok(procs) => procs.into_iter().any(|p| {
-                            matches!(
-                                p.status,
-                                db::models::execution_process::ExecutionProcessStatus::Running
-                            )
-                        }),
-                        Err(_) => true, // assume running on error to avoid duplicate starts
-                    };
+                let running = match ExecutionProcess::find_by_task_attempt_id(
+                    pool,
+                    task_attempt_clone.id,
+                    false,
+                )
+                .await
+                {
+                    Ok(procs) => procs.into_iter().any(|p| {
+                        matches!(
+                            p.status,
+                            db::models::execution_process::ExecutionProcessStatus::Running
+                        )
+                    }),
+                    Err(_) => true, // assume running on error to avoid duplicate starts
+                };
                 if running {
                     return;
                 }
@@ -854,9 +890,8 @@ pub async fn replace_process(
     // Stop any running processes for this attempt
     deployment.container().try_stop(&task_attempt).await;
 
-    // Delete the target process and all later processes
-    let deleted_count =
-        ExecutionProcess::delete_at_and_after(pool, task_attempt.id, proc_id).await?;
+    // Soft-drop the target process and all later processes
+    let deleted_count = ExecutionProcess::drop_at_and_after(pool, task_attempt.id, proc_id).await?;
 
     // Build follow-up executor action using the original process profile
     let initial_executor_profile_id = match &process
@@ -1118,13 +1153,6 @@ pub async fn create_github_pr(
     };
     // Create GitHub service instance
     let github_service = GitHubService::new(&github_token)?;
-    if let Err(e) = github_service.check_token().await {
-        if e.is_api_data() {
-            return Ok(ResponseJson(ApiResponse::error_with_data(e)));
-        } else {
-            return Err(ApiError::GitHubService(e));
-        }
-    }
     // Get the task attempt to access the stored base branch
     let base_branch = request.base_branch.unwrap_or_else(|| {
         // Use the stored base branch from the task attempt as the default
@@ -1147,11 +1175,6 @@ pub async fn create_github_pr(
     let project = Project::find_by_id(pool, task.project_id)
         .await?
         .ok_or(ApiError::Project(ProjectError::ProjectNotFound))?;
-
-    // Use GitService to get the remote URL, then create GitHubRepoInfo
-    let repo_info = deployment
-        .git()
-        .get_github_repo_info(&project.git_repo_path)?;
 
     // Get branch name from task attempt
     let branch_name = task_attempt.branch.as_ref().ok_or_else(|| {
@@ -1208,6 +1231,10 @@ pub async fn create_github_pr(
         head_branch: branch_name.clone(),
         base_branch: norm_base_branch_name.clone(),
     };
+    // Use GitService to get the remote URL, then create GitHubRepoInfo
+    let repo_info = deployment
+        .git()
+        .get_github_repo_info(&project.git_repo_path)?;
 
     match github_service.create_pr(&repo_info, &pr_request).await {
         Ok(pr_info) => {
@@ -1224,6 +1251,10 @@ pub async fn create_github_pr(
                 tracing::error!("Failed to update task attempt PR status: {}", e);
             }
 
+            // Auto-open PR in browser
+            if let Err(e) = utils::browser::open_browser(&pr_info.url).await {
+                tracing::warn!("Failed to open PR in browser: {}", e);
+            }
             deployment
                 .track_if_analytics_allowed(
                     "github_pr_created",
@@ -1692,7 +1723,7 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
             "/follow-up-draft",
             get(get_follow_up_draft).put(save_follow_up_draft),
         )
-        .route("/follow-up-draft/stream", get(stream_follow_up_draft))
+        .route("/follow-up-draft/stream/ws", get(stream_follow_up_draft_ws))
         .route("/follow-up-draft/queue", post(set_follow_up_queue))
         .route("/replace-process", post(replace_process))
         .route("/commit-info", get(get_commit_info))

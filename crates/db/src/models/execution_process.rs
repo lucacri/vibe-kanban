@@ -3,10 +3,25 @@ use executors::actions::ExecutorAction;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{FromRow, SqlitePool, Type};
+use thiserror::Error;
 use ts_rs::TS;
 use uuid::Uuid;
 
 use super::{task::Task, task_attempt::TaskAttempt};
+
+#[derive(Debug, Error)]
+pub enum ExecutionProcessError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error("Execution process not found")]
+    ExecutionProcessNotFound,
+    #[error("Failed to create execution process: {0}")]
+    CreateFailed(String),
+    #[error("Failed to update execution process: {0}")]
+    UpdateFailed(String),
+    #[error("Invalid executor action format")]
+    InvalidExecutorAction,
+}
 
 #[derive(Debug, Clone, Type, Serialize, Deserialize, PartialEq, TS)]
 #[sqlx(type_name = "execution_process_status", rename_all = "lowercase")]
@@ -180,18 +195,33 @@ impl ExecutionProcess {
         .await
     }
 
-    /// Find all execution processes for a task attempt
+    /// Find all execution processes for a task attempt (optionally include soft-deleted)
     pub async fn find_by_task_attempt_id(
         pool: &SqlitePool,
         task_attempt_id: Uuid,
+        show_soft_deleted: bool,
     ) -> Result<Vec<Self>, sqlx::Error> {
         sqlx::query_as!(
             ExecutionProcess,
-            r#"SELECT id as "id!: Uuid", task_attempt_id as "task_attempt_id!: Uuid", run_reason as "run_reason!: ExecutionProcessRunReason", executor_action as "executor_action!: sqlx::types::Json<ExecutorActionField>", before_head_commit,
-                      after_head_commit, status as "status!: ExecutionProcessStatus", exit_code, dropped, started_at as "started_at!: DateTime<Utc>", completed_at as "completed_at?: DateTime<Utc>",
-                      created_at as "created_at!: DateTime<Utc>", updated_at as "updated_at!: DateTime<Utc>"
-               FROM execution_processes WHERE task_attempt_id = ? ORDER BY created_at ASC"#,
-            task_attempt_id
+            r#"SELECT id              as "id!: Uuid",
+                      task_attempt_id as "task_attempt_id!: Uuid",
+                      run_reason      as "run_reason!: ExecutionProcessRunReason",
+                      executor_action as "executor_action!: sqlx::types::Json<ExecutorActionField>",
+                      before_head_commit,
+                      after_head_commit,
+                      status          as "status!: ExecutionProcessStatus",
+                      exit_code,
+                      dropped,
+                      started_at      as "started_at!: DateTime<Utc>",
+                      completed_at    as "completed_at?: DateTime<Utc>",
+                      created_at      as "created_at!: DateTime<Utc>",
+                      updated_at      as "updated_at!: DateTime<Utc>"
+               FROM execution_processes
+               WHERE task_attempt_id = ?
+                 AND (? OR dropped = FALSE)
+               ORDER BY created_at ASC"#,
+            task_attempt_id,
+            show_soft_deleted
         )
         .fetch_all(pool)
         .await
@@ -246,7 +276,7 @@ impl ExecutionProcess {
                JOIN executor_sessions es ON ep.id = es.execution_process_id  
                WHERE ep.task_attempt_id = $1
                  AND ep.run_reason = 'codingagent'
-                 AND ep.dropped = 0
+                 AND ep.dropped = FALSE
                  AND es.session_id IS NOT NULL
                ORDER BY ep.created_at DESC
                LIMIT 1"#,
@@ -272,7 +302,7 @@ impl ExecutionProcess {
                       after_head_commit, status as "status!: ExecutionProcessStatus", exit_code, dropped, started_at as "started_at!: DateTime<Utc>", completed_at as "completed_at?: DateTime<Utc>",
                       created_at as "created_at!: DateTime<Utc>", updated_at as "updated_at!: DateTime<Utc>"
                FROM execution_processes
-               WHERE task_attempt_id = ? AND run_reason = ? AND dropped = 0
+               WHERE task_attempt_id = ? AND run_reason = ? AND dropped = FALSE
                ORDER BY created_at DESC LIMIT 1"#,
             task_attempt_id,
             run_reason
@@ -418,10 +448,10 @@ impl ExecutionProcess {
         // Monotonic drop: only mark newer records as dropped; never undrop.
         sqlx::query!(
             r#"UPDATE execution_processes
-               SET dropped = 1
+               SET dropped = TRUE
              WHERE task_attempt_id = $1
                AND created_at > (SELECT created_at FROM execution_processes WHERE id = $2)
-               AND dropped = 0
+               AND dropped = FALSE
             "#,
             task_attempt_id,
             boundary_process_id
@@ -431,16 +461,18 @@ impl ExecutionProcess {
         Ok(())
     }
 
-    /// Delete processes at and after the specified boundary (inclusive)
-    pub async fn delete_at_and_after(
+    /// Soft-drop processes at and after the specified boundary (inclusive)
+    pub async fn drop_at_and_after(
         pool: &SqlitePool,
         task_attempt_id: Uuid,
         boundary_process_id: Uuid,
     ) -> Result<i64, sqlx::Error> {
         let result = sqlx::query!(
-            r#"DELETE FROM execution_processes
-               WHERE task_attempt_id = $1
-                 AND created_at >= (SELECT created_at FROM execution_processes WHERE id = $2)"#,
+            r#"UPDATE execution_processes
+               SET dropped = TRUE
+             WHERE task_attempt_id = $1
+               AND created_at >= (SELECT created_at FROM execution_processes WHERE id = $2)
+               AND dropped = FALSE"#,
             task_attempt_id,
             boundary_process_id
         )

@@ -9,12 +9,12 @@ use axum::{
     response::{IntoResponse, Json as ResponseJson},
     routing::{get, post},
 };
-use db::models::execution_process::ExecutionProcess;
+use db::models::execution_process::{ExecutionProcess, ExecutionProcessError};
 use deployment::Deployment;
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use services::services::container::ContainerService;
-use utils::response::ApiResponse;
+use utils::{log_msg::LogMsg, response::ApiResponse};
 use uuid::Uuid;
 
 use crate::{DeploymentImpl, error::ApiError, middleware::load_execution_process_middleware};
@@ -22,6 +22,9 @@ use crate::{DeploymentImpl, error::ApiError, middleware::load_execution_process_
 #[derive(Debug, Deserialize)]
 pub struct ExecutionProcessQuery {
     pub task_attempt_id: Uuid,
+    /// If true, include soft-deleted (dropped) processes in results/stream
+    #[serde(default)]
+    pub show_soft_deleted: Option<bool>,
 }
 
 pub async fn get_execution_processes(
@@ -29,8 +32,12 @@ pub async fn get_execution_processes(
     Query(query): Query<ExecutionProcessQuery>,
 ) -> Result<ResponseJson<ApiResponse<Vec<ExecutionProcess>>>, ApiError> {
     let pool = &deployment.db().pool;
-    let execution_processes =
-        ExecutionProcess::find_by_task_attempt_id(pool, query.task_attempt_id).await?;
+    let execution_processes = ExecutionProcess::find_by_task_attempt_id(
+        pool,
+        query.task_attempt_id,
+        query.show_soft_deleted.unwrap_or(false),
+    )
+    .await?;
 
     Ok(ResponseJson(ApiResponse::success(execution_processes)))
 }
@@ -46,12 +53,21 @@ pub async fn stream_raw_logs_ws(
     ws: WebSocketUpgrade,
     State(deployment): State<DeploymentImpl>,
     Path(exec_id): Path<Uuid>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| async move {
+) -> Result<impl IntoResponse, ApiError> {
+    // Check if the stream exists before upgrading the WebSocket
+    let _stream = deployment
+        .container()
+        .stream_raw_logs(&exec_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::ExecutionProcess(ExecutionProcessError::ExecutionProcessNotFound)
+        })?;
+
+    Ok(ws.on_upgrade(move |socket| async move {
         if let Err(e) = handle_raw_logs_ws(socket, deployment, exec_id).await {
             tracing::warn!("raw logs WS closed: {}", e);
         }
-    })
+    }))
 }
 
 async fn handle_raw_logs_ws(
@@ -120,39 +136,37 @@ pub async fn stream_normalized_logs_ws(
     ws: WebSocketUpgrade,
     State(deployment): State<DeploymentImpl>,
     Path(exec_id): Path<Uuid>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_normalized_logs_ws(socket, deployment, exec_id).await {
+) -> Result<impl IntoResponse, ApiError> {
+    let stream = deployment
+        .container()
+        .stream_normalized_logs(&exec_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::ExecutionProcess(ExecutionProcessError::ExecutionProcessNotFound)
+        })?;
+
+    // Convert the error type to anyhow::Error and turn TryStream -> Stream<Result<_, _>>
+    let stream = stream.err_into::<anyhow::Error>().into_stream();
+
+    Ok(ws.on_upgrade(move |socket| async move {
+        if let Err(e) = handle_normalized_logs_ws(socket, stream).await {
             tracing::warn!("normalized logs WS closed: {}", e);
         }
-    })
+    }))
 }
 
 async fn handle_normalized_logs_ws(
     socket: WebSocket,
-    deployment: DeploymentImpl,
-    exec_id: Uuid,
+    stream: impl futures_util::Stream<Item = anyhow::Result<LogMsg>> + Unpin + Send + 'static,
 ) -> anyhow::Result<()> {
-    // Get the raw stream and convert LogMsg to WebSocket messages
-    let mut stream = deployment
-        .container()
-        .stream_normalized_logs(&exec_id)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Execution process not found"))?
-        .map_ok(|msg| msg.to_ws_message_unchecked());
-
-    // Split socket into sender and receiver
+    let mut stream = stream.map_ok(|msg| msg.to_ws_message_unchecked());
     let (mut sender, mut receiver) = socket.split();
-
-    // Drain (and ignore) any client->server messages so pings/pongs work
     tokio::spawn(async move { while let Some(Ok(_)) = receiver.next().await {} });
-
-    // Forward server messages
     while let Some(item) = stream.next().await {
         match item {
             Ok(msg) => {
                 if sender.send(msg).await.is_err() {
-                    break; // client disconnected
+                    break;
                 }
             }
             Err(e) => {
@@ -182,8 +196,13 @@ pub async fn stream_execution_processes_ws(
     Query(query): Query<ExecutionProcessQuery>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) =
-            handle_execution_processes_ws(socket, deployment, query.task_attempt_id).await
+        if let Err(e) = handle_execution_processes_ws(
+            socket,
+            deployment,
+            query.task_attempt_id,
+            query.show_soft_deleted.unwrap_or(false),
+        )
+        .await
         {
             tracing::warn!("execution processes WS closed: {}", e);
         }
@@ -194,11 +213,12 @@ async fn handle_execution_processes_ws(
     socket: WebSocket,
     deployment: DeploymentImpl,
     task_attempt_id: uuid::Uuid,
+    show_soft_deleted: bool,
 ) -> anyhow::Result<()> {
     // Get the raw stream and convert LogMsg to WebSocket messages
     let mut stream = deployment
         .events()
-        .stream_execution_processes_for_attempt_raw(task_attempt_id)
+        .stream_execution_processes_for_attempt_raw(task_attempt_id, show_soft_deleted)
         .await?
         .map_ok(|msg| msg.to_ws_message_unchecked());
 

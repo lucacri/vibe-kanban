@@ -64,7 +64,7 @@ export const useConversationHistory = ({
     onEntriesUpdatedRef.current = onEntriesUpdated;
   }, [onEntriesUpdated]);
 
-  // Keep executionProcesses up to date with executionProcessesRaw
+  // Keep executionProcesses up to date
   useEffect(() => {
     executionProcesses.current = executionProcessesRaw;
   }, [executionProcessesRaw]);
